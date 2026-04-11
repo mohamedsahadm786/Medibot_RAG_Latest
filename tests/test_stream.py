@@ -13,8 +13,8 @@ from backend.database import get_db
 from backend.main import app
 from backend.services.rag_pipeline import GraphState
 
-# Patch memory functions for all tests in this module
-pytestmark = pytest.mark.usefixtures("mock_memory")
+# Patch memory and cache functions for all tests in this module
+pytestmark = pytest.mark.usefixtures("mock_memory", "mock_cache")
 
 
 @pytest.fixture
@@ -25,6 +25,19 @@ def mock_memory():
         new=AsyncMock(return_value=[]),
     ), patch(
         "backend.api.routes.chat.save_turn_summary",
+        new=AsyncMock(return_value=None),
+    ):
+        yield
+
+
+@pytest.fixture
+def mock_cache():
+    """Patch check_cache (miss) and store_cache for all stream endpoint tests."""
+    with patch(
+        "backend.api.routes.chat.check_cache",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "backend.api.routes.chat.store_cache",
         new=AsyncMock(return_value=None),
     ):
         yield
