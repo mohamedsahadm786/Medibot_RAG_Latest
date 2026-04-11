@@ -1,0 +1,51 @@
+services:
+
+  fastapi-backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: medibot-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://medibot:medibot@postgresql:5432/medibot_v2
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - ../.env
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  postgresql:
+    image: postgres:16-alpine
+    container_name: medibot-postgres
+    environment:
+      POSTGRES_USER: medibot
+      POSTGRES_PASSWORD: medibot
+      POSTGRES_DB: medibot_v2
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medibot -d medibot_v2"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: medibot-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
