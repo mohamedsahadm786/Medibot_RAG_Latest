@@ -1,13 +1,15 @@
 """
-MediBot v2 — Query Transformation Service (Phase 4)
+MediBot v2 — Query Transformation Service (Phase 5)
 
-Three-stage pipeline before Pinecone retrieval:
+Full pipeline before generation:
   1. Query Enhancement  — GPT-4o-mini rewrites raw query using conversation context
   2. HyDE              — Generate hypothetical answer, embed it, search (top_k=10)
   3. Multi-Query       — Generate 2 query variants, search each (top_k=5)
-
-Results from all three searches are merged and deduplicated before fetching
-parent chunks from PostgreSQL.
+  4. RRF               — Reciprocal Rank Fusion over all 3 result lists
+  5. Child Fetch        — Retrieve child chunk text from PostgreSQL
+  6. Cross-Encoder     — Re-rank child chunks; keep top 5
+  7. Parent Fetch       — Fetch unique parent chunks from PostgreSQL
+  8. Compression        — GPT-4o-mini extracts relevant sentences per parent
 """
 
 import asyncio
@@ -20,8 +22,11 @@ from langchain_openai import ChatOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
+from backend.services.compressor import compress_contexts
+from backend.services.reranker import rerank_chunks, rrf_merge
 from backend.services.retriever import (
     _encode_query,
+    _fetch_child_chunks,
     _fetch_parent_chunks,
     _pinecone_search,
 )
@@ -145,12 +150,15 @@ async def transform_and_retrieve(
     db: AsyncSession,
 ) -> tuple[str, list[dict[str, Any]]]:
     """
-    Full query transformation + retrieval pipeline:
+    Full query transformation + retrieval + re-ranking + compression pipeline:
       1. Enhance query using conversation summaries
-      2. HyDE + multi-query variants generated concurrently
+      2. HyDE text + query variants generated concurrently
       3. Three Pinecone searches (HyDE top_k=10, var1 top_k=5, var2 top_k=5)
-      4. Deduplicate parent_ids (HyDE results ranked first)
-      5. Fetch parent chunks from PostgreSQL
+      4. RRF merge → ranked child_ids
+      5. Fetch child chunks from PostgreSQL
+      6. Cross-encoder rerank → top 5 child chunks
+      7. Extract unique parent_ids; fetch parent chunks from PostgreSQL
+      8. Contextual compression per parent chunk
 
     Args:
         raw_query:  Original user question.
@@ -158,7 +166,7 @@ async def transform_and_retrieve(
         db:         Async SQLAlchemy session.
 
     Returns:
-        (enhanced_query, list of parent chunk dicts)
+        (enhanced_query, list of compressed parent chunk dicts)
     """
     # Step 1: Enhance query
     enhanced_query = await enhance_query(raw_query, summaries)
@@ -186,29 +194,50 @@ async def transform_and_retrieve(
         len(var2_matches),
     )
 
-    # Step 5: Deduplicate parent_ids (HyDE-ranked first)
-    all_matches = hyde_matches + var1_matches + var2_matches
+    # Step 5: RRF merge → ranked child_ids
+    ranked_child_ids = rrf_merge([hyde_matches, var1_matches, var2_matches])
+
+    if not ranked_child_ids:
+        logger.info("No Pinecone matches — returning empty results")
+        return enhanced_query, []
+
+    # Step 6: Fetch child chunks from PostgreSQL (preserves RRF order)
+    child_uuids: list[uuid.UUID] = []
+    for cid_str in ranked_child_ids:
+        try:
+            child_uuids.append(uuid.UUID(cid_str))
+        except ValueError:
+            logger.warning("Invalid child_id from RRF: %s", cid_str)
+
+    child_chunks = await _fetch_child_chunks(child_uuids, db)
+
+    # Step 7: Cross-encoder rerank → top 5 child chunks
+    top_children = rerank_chunks(enhanced_query, child_chunks, top_n=5)
+
+    # Step 8: Extract unique parent_ids (preserving rerank order)
     parent_ids: list[uuid.UUID] = []
     seen: set[str] = set()
-
-    for match in all_matches:
-        meta = match.get("metadata", {})
-        pid_str = meta.get("parent_id")
+    for chunk in top_children:
+        pid_str = chunk.get("parent_id")
         if pid_str and pid_str not in seen:
             seen.add(pid_str)
             try:
                 parent_ids.append(uuid.UUID(pid_str))
             except ValueError:
-                logger.warning("Invalid parent_id in Pinecone metadata: %s", pid_str)
+                logger.warning("Invalid parent_id in child chunk: %s", pid_str)
 
-    logger.info("Unique parent_ids after dedup: %d", len(parent_ids))
+    logger.info("Unique parent_ids from top children: %d", len(parent_ids))
 
-    # Step 6: Fetch parent chunks from PostgreSQL
-    chunks = await _fetch_parent_chunks(parent_ids, db)
+    # Step 9: Fetch parent chunks from PostgreSQL
+    parent_chunks = await _fetch_parent_chunks(parent_ids, db)
+
+    # Step 10: Contextual compression
+    compressed = await compress_contexts(enhanced_query, parent_chunks)
+
     logger.info(
-        "transform_and_retrieve returning %d chunks for query: %s",
-        len(chunks),
+        "transform_and_retrieve returning %d compressed chunks for: %s",
+        len(compressed),
         enhanced_query[:80],
     )
 
-    return enhanced_query, chunks
+    return enhanced_query, compressed

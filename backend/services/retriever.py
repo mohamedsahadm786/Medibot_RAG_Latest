@@ -119,6 +119,45 @@ def _pinecone_search(
         return []
 
 
+async def _fetch_child_chunks(
+    child_ids: list[uuid.UUID],
+    db: AsyncSession,
+) -> list[dict[str, Any]]:
+    """
+    Fetch child chunks from PostgreSQL by UUID list, preserving RRF order.
+
+    Returns dicts with ``chunk_id``, ``parent_id``, ``content``, and metadata.
+    Chunks without a ``parent_id`` (orphaned children) are skipped.
+    """
+    if not child_ids:
+        return []
+
+    result = await db.execute(
+        sa.select(DocumentChunk).where(
+            DocumentChunk.id.in_(child_ids),
+            DocumentChunk.chunk_type == "child",
+        )
+    )
+    rows = result.scalars().all()
+    chunk_map = {str(row.id): row for row in rows}
+
+    chunks: list[dict[str, Any]] = []
+    for cid in child_ids:
+        row = chunk_map.get(str(cid))
+        if row and row.parent_id is not None:
+            chunks.append(
+                {
+                    "chunk_id": str(row.id),
+                    "parent_id": str(row.parent_id),
+                    "content": row.content,
+                    "page_number": row.page_number or 0,
+                    "section_heading": row.section_heading or "",
+                    "source_pdf": row.source_pdf,
+                }
+            )
+    return chunks
+
+
 async def _fetch_parent_chunks(
     parent_ids: list[uuid.UUID],
     db: AsyncSession,

@@ -1,6 +1,6 @@
 """
-Tests for backend/services/query_transform.py (Phase 4).
-All LLM and Pinecone calls are mocked — no real API usage.
+Tests for backend/services/query_transform.py (Phase 5).
+All LLM, Pinecone, and cross-encoder calls are mocked — no real API usage.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,7 +25,6 @@ async def test_enhance_query_no_history() -> None:
     mock_chain = MagicMock()
     mock_chain.ainvoke = AsyncMock(return_value=fake_response)
 
-    # Patch the module-level prompt so _ENHANCE_PROMPT | llm returns our mock chain
     with patch("backend.services.query_transform._ENHANCE_PROMPT") as mock_prompt:
         mock_prompt.__or__ = MagicMock(return_value=mock_chain)
         result = await enhance_query("what is diabetes?", summaries=[])
@@ -54,19 +53,29 @@ async def test_enhance_query_falls_back_to_raw_on_empty_response() -> None:
 @pytest.mark.asyncio
 async def test_transform_and_retrieve_returns_enhanced_query_and_chunks() -> None:
     """
-    transform_and_retrieve should call enhance, hyde, variants, search Pinecone
-    3 times, deduplicate, and fetch parent chunks.
-    All external calls are mocked.
+    transform_and_retrieve should run the full pipeline:
+    enhance → hyde → variants → pinecone x3 → RRF → fetch children →
+    rerank → fetch parents → compress, returning compressed parent chunks.
     """
     parent_id = str(uuid.uuid4())
-    fake_match = {"metadata": {"parent_id": parent_id, "child_id": str(uuid.uuid4())}}
-    fake_chunk = {
+    child_id = str(uuid.uuid4())
+
+    fake_child = {
+        "chunk_id": child_id,
+        "parent_id": parent_id,
+        "content": "Diabetes content...",
+        "page_number": 10,
+        "section_heading": "Diabetes",
+        "source_pdf": "Medical_book.pdf",
+    }
+    fake_parent = {
         "chunk_id": parent_id,
         "content": "Diabetes content...",
         "page_number": 10,
         "section_heading": "Diabetes",
         "source_pdf": "Medical_book.pdf",
     }
+    fake_compressed = {**fake_parent, "content": "Compressed: Diabetes content."}
 
     db_mock = AsyncMock()
 
@@ -84,10 +93,22 @@ async def test_transform_and_retrieve_returns_enhanced_query_and_chunks() -> Non
         return_value=([0.1] * 768, {"indices": [1], "values": [0.5]}),
     ), patch(
         "backend.services.query_transform._pinecone_search",
-        return_value=[fake_match],
+        return_value=[{"metadata": {"child_id": child_id, "parent_id": parent_id}}],
+    ), patch(
+        "backend.services.query_transform.rrf_merge",
+        return_value=[child_id],
+    ), patch(
+        "backend.services.query_transform._fetch_child_chunks",
+        new=AsyncMock(return_value=[fake_child]),
+    ), patch(
+        "backend.services.query_transform.rerank_chunks",
+        return_value=[fake_child],
     ), patch(
         "backend.services.query_transform._fetch_parent_chunks",
-        new=AsyncMock(return_value=[fake_chunk]),
+        new=AsyncMock(return_value=[fake_parent]),
+    ), patch(
+        "backend.services.query_transform.compress_contexts",
+        new=AsyncMock(return_value=[fake_compressed]),
     ):
         enhanced_query, chunks = await transform_and_retrieve(
             raw_query="what is diabetes?",
@@ -98,16 +119,20 @@ async def test_transform_and_retrieve_returns_enhanced_query_and_chunks() -> Non
     assert enhanced_query == "symptoms of diabetes mellitus"
     assert len(chunks) == 1
     assert chunks[0]["chunk_id"] == parent_id
+    assert chunks[0]["content"] == "Compressed: Diabetes content."
 
 
 @pytest.mark.asyncio
 async def test_transform_and_retrieve_deduplicates_parent_ids() -> None:
     """
-    When HyDE and variant searches return the same parent_id,
-    only one chunk should be fetched.
+    When the top reranked children share a parent_id, only one parent is fetched.
     """
     shared_parent_id = str(uuid.uuid4())
-    fake_match = {"metadata": {"parent_id": shared_parent_id}}
+    child_id_1 = str(uuid.uuid4())
+    child_id_2 = str(uuid.uuid4())
+
+    child_1 = {"chunk_id": child_id_1, "parent_id": shared_parent_id, "content": "A..."}
+    child_2 = {"chunk_id": child_id_2, "parent_id": shared_parent_id, "content": "B..."}
 
     db_mock = AsyncMock()
 
@@ -125,23 +150,34 @@ async def test_transform_and_retrieve_deduplicates_parent_ids() -> None:
         return_value=([0.1] * 768, None),
     ), patch(
         "backend.services.query_transform._pinecone_search",
-        return_value=[fake_match],   # all 3 searches return same match
-    ) as mock_search, patch(
+        return_value=[],
+    ), patch(
+        "backend.services.query_transform.rrf_merge",
+        return_value=[child_id_1, child_id_2],
+    ), patch(
+        "backend.services.query_transform._fetch_child_chunks",
+        new=AsyncMock(return_value=[child_1, child_2]),
+    ), patch(
+        "backend.services.query_transform.rerank_chunks",
+        return_value=[child_1, child_2],  # both map to same parent
+    ), patch(
         "backend.services.query_transform._fetch_parent_chunks",
-        new=AsyncMock(return_value=[{"chunk_id": shared_parent_id}]),
-    ) as mock_fetch:
+        new=AsyncMock(return_value=[{"chunk_id": shared_parent_id, "content": "Parent..."}]),
+    ) as mock_fetch_parents, patch(
+        "backend.services.query_transform.compress_contexts",
+        new=AsyncMock(return_value=[{"chunk_id": shared_parent_id, "content": "Compressed..."}]),
+    ):
         _, chunks = await transform_and_retrieve("query", [], db_mock)
 
-    # Pinecone searched 3 times
-    assert mock_search.call_count == 3
-    # But fetch called with only 1 unique parent_id
-    fetched_ids = mock_fetch.call_args[0][0]
+    # Only 1 unique parent_id should be fetched
+    fetched_ids = mock_fetch_parents.call_args[0][0]
     assert len(fetched_ids) == 1
+    assert len(chunks) == 1
 
 
 @pytest.mark.asyncio
 async def test_transform_and_retrieve_empty_pinecone_returns_empty() -> None:
-    """If all Pinecone searches return no matches, result is empty list."""
+    """If RRF returns no child_ids, result is empty list with no PG calls."""
     db_mock = AsyncMock()
 
     with patch(
@@ -160,10 +196,15 @@ async def test_transform_and_retrieve_empty_pinecone_returns_empty() -> None:
         "backend.services.query_transform._pinecone_search",
         return_value=[],
     ), patch(
-        "backend.services.query_transform._fetch_parent_chunks",
+        "backend.services.query_transform.rrf_merge",
+        return_value=[],
+    ), patch(
+        "backend.services.query_transform._fetch_child_chunks",
         new=AsyncMock(return_value=[]),
-    ):
+    ) as mock_fetch_children:
         enhanced_query, chunks = await transform_and_retrieve("query", [], db_mock)
 
     assert chunks == []
     assert enhanced_query == "enhanced query"
+    # Early return — child fetch should not be called when RRF returns nothing
+    mock_fetch_children.assert_not_called()
