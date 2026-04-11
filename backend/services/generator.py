@@ -28,10 +28,26 @@ Guidelines:
 - This information is for educational purposes only — not a substitute for \
 professional medical advice, diagnosis, or treatment."""
 
-# ── Prompt template ────────────────────────────────────────────────────────────
+STRICT_SYSTEM_PROMPT = SYSTEM_PROMPT + (
+    "\n\nCRITICAL: Every single claim in your answer MUST be explicitly stated "
+    "in the provided context. Do not infer, extrapolate, or add any information "
+    "that is not directly present in the context passages."
+)
+
+# ── Prompt templates ───────────────────────────────────────────────────────────
 _PROMPT = ChatPromptTemplate.from_messages(
     [
         ("system", SYSTEM_PROMPT),
+        (
+            "human",
+            "Medical Reference Context:\n{context}\n\nQuestion: {query}",
+        ),
+    ]
+)
+
+_STRICT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", STRICT_SYSTEM_PROMPT),
         (
             "human",
             "Medical Reference Context:\n{context}\n\nQuestion: {query}",
@@ -79,6 +95,7 @@ def _build_context(chunks: list[dict[str, Any]]) -> str:
 async def generate(
     query: str,
     chunks: list[dict[str, Any]],
+    strict: bool = False,
 ) -> dict[str, Any]:
     """
     Generate a grounded medical answer from retrieved context.
@@ -106,7 +123,7 @@ async def generate(
 
     context = _build_context(chunks)
     llm = _get_llm()
-    chain = _PROMPT | llm
+    chain = (_STRICT_PROMPT if strict else _PROMPT) | llm
 
     logger.info(
         "Calling %s with %d context chunks for query: %s",

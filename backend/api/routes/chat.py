@@ -1,8 +1,8 @@
 """
-MediBot v2 — Chat endpoint (Phase 3)
+MediBot v2 — Chat endpoint (Phase 6)
 
-POST /api/chat — accepts a query, runs hybrid retrieval + GPT-4o generation,
-persists both turns to chat_messages, returns a complete JSON response.
+POST /api/chat — invokes the LangGraph RAG pipeline, persists both
+conversation turns to chat_messages, returns a complete JSON response.
 
 Phase 8 will convert this to SSE streaming.
 """
@@ -16,8 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.database import ChatMessage
 from backend.schemas.chat import ChatRequest, ChatResponse, SourceCitation
-from backend.services.query_transform import transform_and_retrieve
-from backend.services.generator import generate
+from backend.services.rag_pipeline import GraphState, build_pipeline
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -33,10 +32,10 @@ async def chat(
 
     Flow:
       1. Save user message to chat_messages
-      2. Hybrid retrieval (Pinecone dense + sparse → parent chunks from PG)
-      3. GPT-4o generation with medical prompt
-      4. Save assistant message to chat_messages
-      5. Return answer + source citations
+      2. Run LangGraph RAG pipeline (enhance → HyDE → retrieve → rerank →
+         compress → CRAG check → generate → hallucination check)
+      3. Save assistant message to chat_messages
+      4. Return answer + source citations
     """
     message_id = str(uuid.uuid4())
     session_uuid = _parse_session_id(request.session_id)
@@ -51,28 +50,38 @@ async def chat(
     db.add(user_msg)
     await db.commit()
 
-    # ── 2. Transform query + retrieve relevant parent chunks ─────────────────
+    # ── 2. Run LangGraph pipeline ─────────────────────────────────────────────
+    initial_state: GraphState = {
+        "query": request.query,
+        "session_id": request.session_id,
+        "summaries": [],              # Phase 7 will populate from memory
+        "enhanced_query": "",
+        "hyde_answer": "",
+        "query_variants": [],
+        "retrieved_chunks": [],
+        "reranked_chunks": [],
+        "parent_chunks": [],
+        "compressed_contexts": [],
+        "relevance_verdict": "",
+        "answer": "",
+        "sources": [],
+        "hallucination_verdict": "",
+        "retry_count": 0,
+        "hallucination_retry": False,
+        "status_events": [],
+    }
+
     try:
-        enhanced_query, chunks = await transform_and_retrieve(
-            raw_query=request.query,
-            summaries=[],   # Phase 7 will populate from conversation memory
-            db=db,
-        )
+        pipeline = build_pipeline(db)
+        final_state: GraphState = await pipeline.ainvoke(initial_state)
     except Exception as exc:
-        logger.error("Retrieval failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Retrieval service error.")
+        logger.error("RAG pipeline failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="RAG pipeline error.")
 
-    # ── 3. Generate answer ────────────────────────────────────────────────────
-    try:
-        result = await generate(query=enhanced_query, chunks=chunks)
-    except Exception as exc:
-        logger.error("Generation failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Generation service error.")
+    answer: str = final_state["answer"]
+    raw_sources: list[dict] = final_state["sources"]
 
-    answer: str = result["answer"]
-    raw_sources: list[dict] = result["sources"]
-
-    # ── 4. Persist assistant message ──────────────────────────────────────────
+    # ── 3. Persist assistant message ──────────────────────────────────────────
     assistant_msg = ChatMessage(
         id=uuid.UUID(message_id),
         session_id=session_uuid,
@@ -82,7 +91,7 @@ async def chat(
     db.add(assistant_msg)
     await db.commit()
 
-    # ── 5. Build and return response ──────────────────────────────────────────
+    # ── 4. Build and return response ──────────────────────────────────────────
     sources = [
         SourceCitation(
             chunk_id=s["chunk_id"],
