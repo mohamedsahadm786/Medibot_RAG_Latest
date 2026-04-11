@@ -334,14 +334,20 @@ class IngestionPipeline:
             len(children),
         )
 
+        def _sanitize(text: str | None) -> str | None:
+            """Strip null bytes that PostgreSQL UTF-8 rejects."""
+            if text is None:
+                return None
+            return text.replace("\x00", "")
+
         def _make_row(chunk: dict, chunk_type: str) -> DocumentChunk:
             return DocumentChunk(
                 id=uuid.UUID(chunk["id"]),
                 chunk_type=chunk_type,
                 parent_id=uuid.UUID(chunk["parent_id"]) if chunk.get("parent_id") else None,
-                content=chunk["content"],
+                content=_sanitize(chunk["content"]),
                 page_number=chunk["page_number"],
-                section_heading=chunk["section_heading"],
+                section_heading=_sanitize(chunk["section_heading"]),
                 source_pdf=self.source_pdf,
             )
 
