@@ -1,15 +1,17 @@
 """
-MediBot v2 — Chat endpoints (Phase 9)
+MediBot v2 — Chat endpoints (Phase 11)
 
 POST /api/chat        — JSON response (kept for testing / non-streaming clients)
 POST /api/chat/stream — SSE stream: status events → tokens → sources → done
 
 Both endpoints check the semantic cache before running the pipeline.
 Cache hits skip the pipeline and return (or stream) the stored answer.
+Prometheus metrics (cache hits/misses) are incremented on every request.
 """
 
 import asyncio
 import json
+import time
 import uuid
 import logging
 
@@ -17,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
+from backend.core.metrics import cache_hits_total, cache_misses_total
 from backend.database import get_db
 from backend.models.database import ChatMessage
 from backend.schemas.chat import ChatRequest, ChatResponse, SourceCitation
@@ -55,12 +58,15 @@ async def chat(
         cached = None
 
     if cached is not None:
+        cache_hits_total.inc()
         return ChatResponse(
             message_id=str(uuid.uuid4()),
             session_id=request.session_id,
             answer=cached["answer"],
             sources=[SourceCitation(**s) for s in cached["sources"]],
         )
+
+    cache_misses_total.inc()
 
     # ── 1. Load conversation memory ───────────────────────────────────────────
     message_id = str(uuid.uuid4())
@@ -99,12 +105,14 @@ async def chat(
         "status_events": [],
     }
 
+    _pipeline_start = time.perf_counter()
     try:
         pipeline = build_pipeline(db)
         final_state: GraphState = await pipeline.ainvoke(initial_state)
     except Exception as exc:
         logger.error("RAG pipeline failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="RAG pipeline error.")
+    _pipeline_latency_ms = int((time.perf_counter() - _pipeline_start) * 1000)
 
     answer: str = final_state["answer"]
     raw_sources: list[dict] = final_state["sources"]
@@ -151,7 +159,7 @@ async def chat(
             },
             relevance_verdict=final_state["relevance_verdict"],
             hallucination_verdict=final_state["hallucination_verdict"],
-            latency_ms=0,
+            latency_ms=_pipeline_latency_ms,
         )
         evaluate_with_ragas.delay(
             message_id=message_id,
@@ -218,6 +226,7 @@ async def chat_stream(
             cached = None
 
         if cached is not None:
+            cache_hits_total.inc()
             cached_answer: str = cached.get("answer", "")
             if cached_answer:
                 words = cached_answer.split(" ")
@@ -231,6 +240,8 @@ async def chat_stream(
                 "session_id": request.session_id,
             })
             return
+
+        cache_misses_total.inc()
 
         # ── 1. Load conversation memory ────────────────────────────────────
         summaries = await load_summaries(session_uuid, db)
@@ -267,12 +278,14 @@ async def chat_stream(
         }
 
         event_queue: asyncio.Queue = asyncio.Queue()
+        _pipeline_start = time.perf_counter()
 
         async def run_pipeline() -> None:
             try:
                 pipeline = build_pipeline(db, event_queue=event_queue)
                 final_state: GraphState = await pipeline.ainvoke(initial_state)
-                await event_queue.put({"type": "final", "state": final_state})
+                latency_ms = int((time.perf_counter() - _pipeline_start) * 1000)
+                await event_queue.put({"type": "final", "state": final_state, "latency_ms": latency_ms})
             except Exception as exc:
                 logger.error("SSE pipeline error: %s", exc, exc_info=True)
                 await event_queue.put({"type": "error", "message": str(exc)})
@@ -295,6 +308,7 @@ async def chat_stream(
                     yield json.dumps(event)
                 elif event_type == "final":
                     final_state = event["state"]
+                    _stream_latency_ms: int = event.get("latency_ms", 0)
                 elif event_type == "error":
                     yield json.dumps({"type": "error", "message": event["message"]})
                     return
@@ -355,7 +369,7 @@ async def chat_stream(
                     },
                     relevance_verdict=final_state["relevance_verdict"],
                     hallucination_verdict=final_state["hallucination_verdict"],
-                    latency_ms=0,
+                    latency_ms=_stream_latency_ms,
                 )
                 evaluate_with_ragas.delay(
                     message_id=message_id,
