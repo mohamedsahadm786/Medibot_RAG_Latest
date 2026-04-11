@@ -1,6 +1,6 @@
 """
-Tests for POST /api/chat endpoint (Phase 6).
-Mocks the LangGraph pipeline so no real Pinecone/OpenAI calls are made.
+Tests for POST /api/chat endpoint (Phase 7).
+Mocks the LangGraph pipeline and memory service so no real calls are made.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,6 +11,22 @@ from httpx import ASGITransport, AsyncClient
 from backend.database import get_db
 from backend.main import app
 from backend.services.rag_pipeline import GraphState
+
+# Patch memory functions for all tests in this module
+pytestmark = pytest.mark.usefixtures("mock_memory")
+
+
+@pytest.fixture
+def mock_memory():
+    """Patch load_summaries and save_turn_summary for all chat endpoint tests."""
+    with patch(
+        "backend.api.routes.chat.load_summaries",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "backend.api.routes.chat.save_turn_summary",
+        new=AsyncMock(return_value=None),
+    ):
+        yield
 
 
 @pytest.fixture
@@ -132,6 +148,43 @@ async def test_chat_missing_query_returns_422(mock_db) -> None:
             json={"session_id": "33333333-3333-3333-3333-333333333333"},
         )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_chat_passes_summaries_to_pipeline(mock_db) -> None:
+    """Summaries loaded from memory should be forwarded to the pipeline state."""
+    pipeline_result = _make_pipeline_result(answer="Answer.", sources=[])
+    mock_compiled = MagicMock()
+    mock_compiled.ainvoke = AsyncMock(return_value=pipeline_result)
+
+    captured_state: list[dict] = []
+
+    async def capturing_ainvoke(state: dict) -> GraphState:
+        captured_state.append(state)
+        return pipeline_result
+
+    mock_compiled.ainvoke = capturing_ainvoke
+
+    with patch("backend.api.routes.chat.build_pipeline", return_value=mock_compiled), \
+         patch(
+             "backend.api.routes.chat.load_summaries",
+             new=AsyncMock(return_value=["User asked about aspirin; assistant explained it."]),
+         ), \
+         patch("backend.api.routes.chat.save_turn_summary", new=AsyncMock()):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post(
+                "/api/chat",
+                json={
+                    "session_id": "55555555-5555-5555-5555-555555555555",
+                    "query": "Is it safe to take it daily?",
+                },
+            )
+
+    assert len(captured_state) == 1
+    assert captured_state[0]["summaries"] == [
+        "User asked about aspirin; assistant explained it."
+    ]
 
 
 @pytest.mark.asyncio

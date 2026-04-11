@@ -1,8 +1,8 @@
 """
-MediBot v2 — Chat endpoint (Phase 6)
+MediBot v2 — Chat endpoint (Phase 7)
 
-POST /api/chat — invokes the LangGraph RAG pipeline, persists both
-conversation turns to chat_messages, returns a complete JSON response.
+POST /api/chat — loads conversation memory, invokes the LangGraph RAG
+pipeline, persists both turns, saves a turn summary for future context.
 
 Phase 8 will convert this to SSE streaming.
 """
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.database import ChatMessage
 from backend.schemas.chat import ChatRequest, ChatResponse, SourceCitation
+from backend.services.memory import load_summaries, save_turn_summary
 from backend.services.rag_pipeline import GraphState, build_pipeline
 
 logger = logging.getLogger(__name__)
@@ -31,16 +32,20 @@ async def chat(
     Medical Q&A endpoint.
 
     Flow:
-      1. Save user message to chat_messages
-      2. Run LangGraph RAG pipeline (enhance → HyDE → retrieve → rerank →
-         compress → CRAG check → generate → hallucination check)
-      3. Save assistant message to chat_messages
-      4. Return answer + source citations
+      1. Load last N conversation summaries (sliding-window memory)
+      2. Save user message to chat_messages
+      3. Run LangGraph RAG pipeline with summaries as context
+      4. Save assistant message to chat_messages
+      5. Generate + save 1-sentence turn summary for future context
+      6. Return answer + source citations
     """
     message_id = str(uuid.uuid4())
     session_uuid = _parse_session_id(request.session_id)
 
-    # ── 1. Persist user message ───────────────────────────────────────────────
+    # ── 1. Load conversation memory ───────────────────────────────────────────
+    summaries = await load_summaries(session_uuid, db)
+
+    # ── 2. Persist user message ───────────────────────────────────────────────
     user_msg = ChatMessage(
         id=uuid.uuid4(),
         session_id=session_uuid,
@@ -50,11 +55,11 @@ async def chat(
     db.add(user_msg)
     await db.commit()
 
-    # ── 2. Run LangGraph pipeline ─────────────────────────────────────────────
+    # ── 3. Run LangGraph pipeline ─────────────────────────────────────────────
     initial_state: GraphState = {
         "query": request.query,
         "session_id": request.session_id,
-        "summaries": [],              # Phase 7 will populate from memory
+        "summaries": summaries,
         "enhanced_query": "",
         "hyde_answer": "",
         "query_variants": [],
@@ -81,7 +86,7 @@ async def chat(
     answer: str = final_state["answer"]
     raw_sources: list[dict] = final_state["sources"]
 
-    # ── 3. Persist assistant message ──────────────────────────────────────────
+    # ── 4. Persist assistant message ──────────────────────────────────────────
     assistant_msg = ChatMessage(
         id=uuid.UUID(message_id),
         session_id=session_uuid,
@@ -91,7 +96,20 @@ async def chat(
     db.add(assistant_msg)
     await db.commit()
 
-    # ── 4. Build and return response ──────────────────────────────────────────
+    # ── 5. Generate and persist turn summary ──────────────────────────────────
+    try:
+        await save_turn_summary(
+            assistant_message_id=uuid.UUID(message_id),
+            query=request.query,
+            answer=answer,
+            db=db,
+        )
+    except Exception as exc:
+        # Non-critical: log and continue — missing summary only affects
+        # future context, not the current response
+        logger.warning("Failed to save turn summary: %s", exc)
+
+    # ── 6. Build and return response ──────────────────────────────────────────
     sources = [
         SourceCitation(
             chunk_id=s["chunk_id"],
