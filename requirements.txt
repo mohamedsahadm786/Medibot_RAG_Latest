@@ -25,6 +25,8 @@ transformers>=4.40.0
 # ── Vector DB ──────────────────────────────────────────────────────────────────
 pinecone>=4.0.0
 pinecone-text>=0.9.0
+langchain-openai>=0.1.0
+langchain-pinecone>=0.1.0
 
 # ── PDF processing ─────────────────────────────────────────────────────────────
 pymupdf>=1.24.0

@@ -358,11 +358,16 @@ class IngestionPipeline:
 
     # ── Step 5+6: Embeddings ───────────────────────────────────────────────────
 
-    def fit_bm25(self, texts: list[str]) -> BM25Encoder:
-        """Fit BM25 vocabulary + IDF on all child texts."""
+    def fit_bm25(self, texts: list[str], save_path: str = "data/bm25_encoder.json") -> BM25Encoder:
+        """
+        Fit BM25 vocabulary + IDF on all child texts and save to disk.
+        The retriever loads this file at query time.
+        """
         logger.info("Fitting BM25 on %d documents...", len(texts))
         self._bm25 = BM25Encoder()
         self._bm25.fit(texts)
+        self._bm25.dump(save_path)
+        logger.info("BM25 encoder saved to %s", save_path)
         return self._bm25
 
     # ── Step 7: Pinecone upsert ────────────────────────────────────────────────
