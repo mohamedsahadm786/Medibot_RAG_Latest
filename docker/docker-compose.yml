@@ -46,6 +46,28 @@ services:
       - redis_data:/data
     restart: unless-stopped
 
+  celery-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: medibot-celery
+    command: >
+      celery -A backend.celery_app.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --queues=celery
+    environment:
+      DATABASE_URL: postgresql+asyncpg://medibot:medibot@postgresql:5432/medibot_v2
+      REDIS_URL: redis://redis:6379/0
+    env_file:
+      - ../.env
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:

@@ -21,6 +21,7 @@ from backend.database import get_db
 from backend.models.database import ChatMessage
 from backend.schemas.chat import ChatRequest, ChatResponse, SourceCitation
 from backend.services.cache import check_cache, store_cache
+from backend.services.evaluation import evaluate_with_ragas, log_retrieval_details
 from backend.services.memory import load_summaries, save_turn_summary
 from backend.services.rag_pipeline import GraphState, build_pipeline
 
@@ -135,7 +136,33 @@ async def chat(
     except Exception as exc:
         logger.warning("Failed to store cache: %s", exc)
 
-    # ── 7. Build and return response ──────────────────────────────────────────
+    # ── 7. Queue background evaluation tasks ──────────────────────────────────
+    try:
+        contexts = [c.get("content", "") for c in final_state["compressed_contexts"]]
+        log_retrieval_details.delay(
+            message_id=message_id,
+            enhanced_query=final_state["enhanced_query"],
+            hyde_answer=final_state["hyde_answer"],
+            retrieved_child_ids=[c["child_id"] for c in final_state["retrieved_chunks"]],
+            retrieved_parent_ids=[c.get("chunk_id", "") for c in final_state["parent_chunks"]],
+            reranker_scores={
+                c.get("chunk_id", f"chunk_{i}"): float(i + 1)
+                for i, c in enumerate(final_state["reranked_chunks"])
+            },
+            relevance_verdict=final_state["relevance_verdict"],
+            hallucination_verdict=final_state["hallucination_verdict"],
+            latency_ms=0,
+        )
+        evaluate_with_ragas.delay(
+            message_id=message_id,
+            query=request.query,
+            answer=answer,
+            contexts=contexts,
+        )
+    except Exception as exc:
+        logger.warning("Failed to queue evaluation tasks: %s", exc)
+
+    # ── 8. Build and return response ──────────────────────────────────────────
     sources = [
         SourceCitation(
             chunk_id=s["chunk_id"],
@@ -313,7 +340,33 @@ async def chat_stream(
             except Exception as exc:
                 logger.warning("Failed to store cache (stream): %s", exc)
 
-            # ── 9. Emit sources and done ───────────────────────────────────
+            # ── 9. Queue background evaluation tasks ───────────────────────
+            try:
+                contexts = [c.get("content", "") for c in final_state["compressed_contexts"]]
+                log_retrieval_details.delay(
+                    message_id=message_id,
+                    enhanced_query=final_state["enhanced_query"],
+                    hyde_answer=final_state["hyde_answer"],
+                    retrieved_child_ids=[c["child_id"] for c in final_state["retrieved_chunks"]],
+                    retrieved_parent_ids=[c.get("chunk_id", "") for c in final_state["parent_chunks"]],
+                    reranker_scores={
+                        c.get("chunk_id", f"chunk_{i}"): float(i + 1)
+                        for i, c in enumerate(final_state["reranked_chunks"])
+                    },
+                    relevance_verdict=final_state["relevance_verdict"],
+                    hallucination_verdict=final_state["hallucination_verdict"],
+                    latency_ms=0,
+                )
+                evaluate_with_ragas.delay(
+                    message_id=message_id,
+                    query=request.query,
+                    answer=answer,
+                    contexts=contexts,
+                )
+            except Exception as exc:
+                logger.warning("Failed to queue evaluation tasks (stream): %s", exc)
+
+            # ── 10. Emit sources and done ──────────────────────────────────
             sources = [
                 SourceCitation(
                     chunk_id=s["chunk_id"],
