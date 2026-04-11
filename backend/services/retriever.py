@@ -70,38 +70,38 @@ def _get_pinecone_index():
     return _pinecone_index
 
 
-# ── Main retrieval function ────────────────────────────────────────────────────
+# ── Shared helpers (used by query_transform.py too) ───────────────────────────
 
-async def retrieve(
-    query: str,
-    db: AsyncSession,
-    top_k: int = TOP_K,
-) -> list[dict[str, Any]]:
+def _encode_query(text: str) -> tuple[list[float], dict | None]:
     """
-    Full hybrid retrieval pipeline:
-      1. Embed query with PubMedBERT (dense, 768-dim)
-      2. Encode query with BM25 (sparse) — skipped if encoder not available
-      3. Single hybrid Pinecone query
-      4. Extract parent_ids from result metadata
-      5. Fetch parent chunk content from PostgreSQL
-      6. Return list of parent chunk dicts with metadata
+    Encode a text string for hybrid Pinecone search.
 
-    Returns [] if Pinecone index doesn't exist or no results found.
+    Returns:
+        (dense_vector, sparse_vector) — sparse_vector is None if BM25 not loaded.
     """
-    # ── Step 1: Dense embedding ───────────────────────────────────────────────
     model = _get_model()
     dense_vector: list[float] = model.encode(
-        [query], normalize_embeddings=True
+        [text], normalize_embeddings=True
     )[0].tolist()
 
-    # ── Step 2: Sparse encoding ───────────────────────────────────────────────
     bm25 = _get_bm25()
     sparse_vector: dict | None = None
     if bm25 is not None:
-        encoded = bm25.encode_queries([query])
+        encoded = bm25.encode_queries([text])
         sparse_vector = encoded[0] if encoded else None
 
-    # ── Step 3: Pinecone hybrid query ─────────────────────────────────────────
+    return dense_vector, sparse_vector
+
+
+def _pinecone_search(
+    dense_vector: list[float],
+    sparse_vector: dict | None,
+    top_k: int,
+) -> list[dict]:
+    """
+    Single Pinecone hybrid query. Returns raw match dicts (with metadata).
+    Returns [] on any error.
+    """
     try:
         index = _get_pinecone_index()
         query_kwargs: dict[str, Any] = {
@@ -112,20 +112,74 @@ async def retrieve(
         }
         if sparse_vector:
             query_kwargs["sparse_vector"] = sparse_vector
-
         results = index.query(**query_kwargs)
+        return results.get("matches", [])
     except Exception as exc:
         logger.error("Pinecone query failed: %s", exc)
         return []
 
-    matches = results.get("matches", [])
+
+async def _fetch_parent_chunks(
+    parent_ids: list[uuid.UUID],
+    db: AsyncSession,
+) -> list[dict[str, Any]]:
+    """
+    Fetch parent chunks from PostgreSQL by UUID list.
+    Preserves the order of parent_ids (Pinecone ranking order).
+    """
+    if not parent_ids:
+        return []
+
+    result = await db.execute(
+        sa.select(DocumentChunk).where(
+            DocumentChunk.id.in_(parent_ids),
+            DocumentChunk.chunk_type == "parent",
+        )
+    )
+    rows = result.scalars().all()
+    parent_map = {str(row.id): row for row in rows}
+
+    chunks: list[dict[str, Any]] = []
+    for pid in parent_ids:
+        row = parent_map.get(str(pid))
+        if row:
+            chunks.append(
+                {
+                    "chunk_id": str(row.id),
+                    "content": row.content,
+                    "page_number": row.page_number or 0,
+                    "section_heading": row.section_heading or "",
+                    "source_pdf": row.source_pdf,
+                }
+            )
+    return chunks
+
+
+# ── Main retrieval function ────────────────────────────────────────────────────
+
+async def retrieve(
+    query: str,
+    db: AsyncSession,
+    top_k: int = TOP_K,
+) -> list[dict[str, Any]]:
+    """
+    Direct hybrid retrieval (single query, no transformation).
+
+    Used as a fallback and in tests. Phase 4 chat endpoint uses
+    transform_and_retrieve() from query_transform.py instead.
+
+    Returns [] if Pinecone index doesn't exist or no results found.
+    """
+    dense_vector, sparse_vector = _encode_query(query)
+
+    matches = _pinecone_search(dense_vector, sparse_vector, top_k)
     if not matches:
         logger.info("No Pinecone matches for query: %s", query[:80])
         return []
 
     logger.info("Pinecone returned %d matches", len(matches))
 
-    # ── Step 4: Extract unique parent_ids from metadata ───────────────────────
+    # Extract unique parent_ids preserving Pinecone ranking order
     parent_ids: list[uuid.UUID] = []
     seen: set[str] = set()
     for match in matches:
@@ -142,36 +196,6 @@ async def retrieve(
         logger.warning("No valid parent_ids found in Pinecone results")
         return []
 
-    # ── Step 5: Fetch parent chunks from PostgreSQL ───────────────────────────
-    result = await db.execute(
-        sa.select(DocumentChunk).where(
-            DocumentChunk.id.in_(parent_ids),
-            DocumentChunk.chunk_type == "parent",
-        )
-    )
-    parent_rows = result.scalars().all()
-
-    if not parent_rows:
-        logger.warning("Parent chunks not found in PostgreSQL for ids: %s", parent_ids)
-        return []
-
-    # ── Step 6: Build return payload ──────────────────────────────────────────
-    # Preserve Pinecone ranking order
-    parent_map = {str(row.id): row for row in parent_rows}
-    chunks: list[dict[str, Any]] = []
-
-    for pid in parent_ids:
-        row = parent_map.get(str(pid))
-        if row:
-            chunks.append(
-                {
-                    "chunk_id": str(row.id),
-                    "content": row.content,
-                    "page_number": row.page_number or 0,
-                    "section_heading": row.section_heading or "",
-                    "source_pdf": row.source_pdf,
-                }
-            )
-
+    chunks = await _fetch_parent_chunks(parent_ids, db)
     logger.info("Returning %d parent chunks for generation", len(chunks))
     return chunks

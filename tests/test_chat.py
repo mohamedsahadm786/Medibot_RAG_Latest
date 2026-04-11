@@ -1,6 +1,6 @@
 """
-Tests for POST /api/chat endpoint (Phase 3).
-Mocks retriever and generator so no real Pinecone/OpenAI calls are made.
+Tests for POST /api/chat endpoint (Phase 4).
+Mocks transform_and_retrieve and generator so no real Pinecone/OpenAI calls are made.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -52,9 +52,13 @@ async def test_chat_returns_answer(mock_db) -> None:
         ],
     }
 
-    with patch("backend.api.routes.chat.retrieve", new=AsyncMock(return_value=fake_chunks)), \
-         patch("backend.api.routes.chat.generate", new=AsyncMock(return_value=fake_generation)):
-
+    with patch(
+        "backend.api.routes.chat.transform_and_retrieve",
+        new=AsyncMock(return_value=("What is diabetes mellitus?", fake_chunks)),
+    ), patch(
+        "backend.api.routes.chat.generate",
+        new=AsyncMock(return_value=fake_generation),
+    ):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(
@@ -83,9 +87,13 @@ async def test_chat_empty_retrieval_returns_no_info_message(mock_db) -> None:
         "sources": [],
     }
 
-    with patch("backend.api.routes.chat.retrieve", new=AsyncMock(return_value=[])), \
-         patch("backend.api.routes.chat.generate", new=AsyncMock(return_value=fake_generation)):
-
+    with patch(
+        "backend.api.routes.chat.transform_and_retrieve",
+        new=AsyncMock(return_value=("What is condition XYZ?", [])),
+    ), patch(
+        "backend.api.routes.chat.generate",
+        new=AsyncMock(return_value=fake_generation),
+    ):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.post(

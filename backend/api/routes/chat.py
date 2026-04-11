@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.database import ChatMessage
 from backend.schemas.chat import ChatRequest, ChatResponse, SourceCitation
-from backend.services.retriever import retrieve
+from backend.services.query_transform import transform_and_retrieve
 from backend.services.generator import generate
 
 logger = logging.getLogger(__name__)
@@ -51,16 +51,20 @@ async def chat(
     db.add(user_msg)
     await db.commit()
 
-    # ── 2. Retrieve relevant parent chunks ────────────────────────────────────
+    # ── 2. Transform query + retrieve relevant parent chunks ─────────────────
     try:
-        chunks = await retrieve(query=request.query, db=db)
+        enhanced_query, chunks = await transform_and_retrieve(
+            raw_query=request.query,
+            summaries=[],   # Phase 7 will populate from conversation memory
+            db=db,
+        )
     except Exception as exc:
         logger.error("Retrieval failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Retrieval service error.")
 
     # ── 3. Generate answer ────────────────────────────────────────────────────
     try:
-        result = await generate(query=request.query, chunks=chunks)
+        result = await generate(query=enhanced_query, chunks=chunks)
     except Exception as exc:
         logger.error("Generation failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Generation service error.")
