@@ -56,7 +56,8 @@ def _get_bm25() -> BM25Encoder | None:
             )
             return None
         logger.info("Loading BM25 encoder from %s", BM25_PATH)
-        _bm25 = BM25Encoder.load(BM25_PATH)
+        _bm25 = BM25Encoder()
+        _bm25.load(path=BM25_PATH)
     return _bm25
 
 
