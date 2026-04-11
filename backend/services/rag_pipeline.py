@@ -28,6 +28,7 @@ Graph topology:
                               └─ ungrounded (second) → END
 """
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -151,7 +152,10 @@ def _format_context(chunks: list[dict]) -> str:
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
 
-def build_pipeline(db: AsyncSession):
+def build_pipeline(
+    db: AsyncSession,
+    event_queue: asyncio.Queue | None = None,
+):
     """
     Build and compile the LangGraph RAG pipeline.
 
@@ -159,7 +163,10 @@ def build_pipeline(db: AsyncSession):
     live in the graph state (it's not JSON-serialisable).
 
     Args:
-        db: Open async SQLAlchemy session for PostgreSQL queries.
+        db:          Open async SQLAlchemy session for PostgreSQL queries.
+        event_queue: Optional asyncio.Queue for SSE streaming. When provided,
+                     nodes push ``{"type": "status", "step": ..., "message": ...}``
+                     dicts so the SSE endpoint can forward them in real time.
 
     Returns:
         A compiled LangGraph graph ready for ``ainvoke()``.
@@ -171,8 +178,22 @@ def build_pipeline(db: AsyncSession):
         """Rewrite the raw query using conversation context."""
         is_crag_retry = state["retry_count"] > 0
         events = state.get("status_events", [])
+
         if is_crag_retry:
             events = events + ["Refining search for better results..."]
+            if event_queue is not None:
+                await event_queue.put({
+                    "type": "status",
+                    "step": "refining",
+                    "message": "Refining search for better results...",
+                })
+        else:
+            if event_queue is not None:
+                await event_queue.put({
+                    "type": "status",
+                    "step": "thinking",
+                    "message": "Understanding your question...",
+                })
 
         enhanced = await enhance_query(state["query"], state["summaries"])
         logger.info("enhance_query → %r", enhanced[:80])
@@ -185,7 +206,6 @@ def build_pipeline(db: AsyncSession):
 
     async def node_hyde_and_multiquery(state: GraphState) -> dict:
         """Generate HyDE hypothetical answer and 2 query variants concurrently."""
-        import asyncio
         hyde_text, variants = await asyncio.gather(
             _generate_hyde_text(state["enhanced_query"]),
             _generate_variants(state["enhanced_query"]),
@@ -217,6 +237,13 @@ def build_pipeline(db: AsyncSession):
         ranked_ids = rrf_merge([hyde_matches, var1_matches, var2_matches])
         retrieved = [{"child_id": cid} for cid in ranked_ids]
 
+        if event_queue is not None:
+            await event_queue.put({
+                "type": "status",
+                "step": "searching",
+                "message": "Searching medical knowledge base...",
+            })
+
         events = state.get("status_events", []) + ["Searching medical knowledge base..."]
         return {
             "retrieved_chunks": retrieved,
@@ -236,6 +263,13 @@ def build_pipeline(db: AsyncSession):
 
         child_chunks = await _fetch_child_chunks(child_ids, db)
         top_children = rerank_chunks(state["enhanced_query"], child_chunks, top_n=5)
+
+        if event_queue is not None:
+            await event_queue.put({
+                "type": "status",
+                "step": "analyzing",
+                "message": "Analyzing relevant sources...",
+            })
 
         events = state.get("status_events", []) + ["Analyzing relevant sources..."]
         return {
@@ -325,6 +359,13 @@ def build_pipeline(db: AsyncSession):
                 f"{query}\n\n[Note: context is partially relevant. "
                 "Clearly note any gaps in the available information.]"
             )
+
+        if event_queue is not None:
+            await event_queue.put({
+                "type": "status",
+                "step": "generating",
+                "message": "",
+            })
 
         result = await generate(query=query, chunks=chunks, strict=strict)
         logger.info(
