@@ -15,7 +15,9 @@ import time
 import uuid
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
@@ -30,11 +32,14 @@ from backend.services.rag_pipeline import GraphState, build_pipeline
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 
 @router.post("/chat", response_model=ChatResponse)
+@limiter.limit(f"{10}/minute")
 async def chat(
-    request: ChatRequest,
+    request: Request,
+    body: ChatRequest,
     db: AsyncSession = Depends(get_db),
 ) -> ChatResponse:
     """
@@ -52,7 +57,7 @@ async def chat(
     """
     # ── 0. Semantic cache check ───────────────────────────────────────────────
     try:
-        cached = await check_cache(request.query)
+        cached = await check_cache(body.query)
     except Exception as exc:
         logger.warning("Cache check failed: %s", exc)
         cached = None
@@ -61,7 +66,7 @@ async def chat(
         cache_hits_total.inc()
         return ChatResponse(
             message_id=str(uuid.uuid4()),
-            session_id=request.session_id,
+            session_id=body.session_id,
             answer=cached["answer"],
             sources=[SourceCitation(**s) for s in cached["sources"]],
         )
@@ -70,7 +75,7 @@ async def chat(
 
     # ── 1. Load conversation memory ───────────────────────────────────────────
     message_id = str(uuid.uuid4())
-    session_uuid = _parse_session_id(request.session_id)
+    session_uuid = _parse_session_id(body.session_id)
 
     summaries = await load_summaries(session_uuid, db)
 
@@ -79,16 +84,17 @@ async def chat(
         id=uuid.uuid4(),
         session_id=session_uuid,
         role="user",
-        content=request.query,
+        content=body.query,
     )
     db.add(user_msg)
     await db.commit()
 
     # ── 3. Run LangGraph pipeline ─────────────────────────────────────────────
     initial_state: GraphState = {
-        "query": request.query,
-        "session_id": request.session_id,
+        "query": body.query,
+        "session_id": body.session_id,
         "summaries": summaries,
+        "intent": "",
         "enhanced_query": "",
         "hyde_answer": "",
         "query_variants": [],
@@ -131,7 +137,7 @@ async def chat(
     try:
         await save_turn_summary(
             assistant_message_id=uuid.UUID(message_id),
-            query=request.query,
+            query=body.query,
             answer=answer,
             db=db,
         )
@@ -140,35 +146,39 @@ async def chat(
 
     # ── 6. Store result in semantic cache ─────────────────────────────────────
     try:
-        await store_cache(request.query, answer, raw_sources)
+        await store_cache(body.query, answer, raw_sources)
     except Exception as exc:
         logger.warning("Failed to store cache: %s", exc)
 
-    # ── 7. Queue background evaluation tasks ──────────────────────────────────
-    try:
-        contexts = [c.get("content", "") for c in final_state["compressed_contexts"]]
-        log_retrieval_details.delay(
-            message_id=message_id,
-            enhanced_query=final_state["enhanced_query"],
-            hyde_answer=final_state["hyde_answer"],
-            retrieved_child_ids=[c["child_id"] for c in final_state["retrieved_chunks"]],
-            retrieved_parent_ids=[c.get("chunk_id", "") for c in final_state["parent_chunks"]],
-            reranker_scores={
-                c.get("chunk_id", f"chunk_{i}"): float(i + 1)
-                for i, c in enumerate(final_state["reranked_chunks"])
-            },
-            relevance_verdict=final_state["relevance_verdict"],
-            hallucination_verdict=final_state["hallucination_verdict"],
-            latency_ms=_pipeline_latency_ms,
-        )
-        evaluate_with_ragas.delay(
-            message_id=message_id,
-            query=request.query,
-            answer=answer,
-            contexts=contexts,
-        )
-    except Exception as exc:
-        logger.warning("Failed to queue evaluation tasks: %s", exc)
+    # ── 7. Queue background evaluation tasks (medical queries only) ───────────
+    # Skip RAGAS evaluation for conversational queries — they have no RAG
+    # context and would produce meaningless 0% scores that pollute averages.
+    is_medical = final_state.get("intent", "medical") != "conversational"
+    if is_medical:
+        try:
+            contexts = [c.get("content", "") for c in final_state["compressed_contexts"]]
+            log_retrieval_details.delay(
+                message_id=message_id,
+                enhanced_query=final_state["enhanced_query"],
+                hyde_answer=final_state["hyde_answer"],
+                retrieved_child_ids=[c["child_id"] for c in final_state["retrieved_chunks"]],
+                retrieved_parent_ids=[c.get("chunk_id", "") for c in final_state["parent_chunks"]],
+                reranker_scores={
+                    c.get("chunk_id", f"chunk_{i}"): float(i + 1)
+                    for i, c in enumerate(final_state["reranked_chunks"])
+                },
+                relevance_verdict=final_state["relevance_verdict"],
+                hallucination_verdict=final_state["hallucination_verdict"],
+                latency_ms=_pipeline_latency_ms,
+            )
+            evaluate_with_ragas.delay(
+                message_id=message_id,
+                query=body.query,
+                answer=answer,
+                contexts=contexts,
+            )
+        except Exception as exc:
+            logger.warning("Failed to queue evaluation tasks: %s", exc)
 
     # ── 8. Build and return response ──────────────────────────────────────────
     sources = [
@@ -184,15 +194,17 @@ async def chat(
 
     return ChatResponse(
         message_id=message_id,
-        session_id=request.session_id,
+        session_id=body.session_id,
         answer=answer,
         sources=sources,
     )
 
 
 @router.post("/chat/stream")
+@limiter.limit(f"{10}/minute")
 async def chat_stream(
-    request: ChatRequest,
+    request: Request,
+    body: ChatRequest,
     db: AsyncSession = Depends(get_db),
 ) -> EventSourceResponse:
     """
@@ -213,14 +225,14 @@ async def chat_stream(
       {"type": "error", "message": "<reason>"}
     """
     message_id = str(uuid.uuid4())
-    session_uuid = _parse_session_id(request.session_id)
+    session_uuid = _parse_session_id(body.session_id)
 
     async def generate():
         """Yield SSE-formatted strings for the EventSourceResponse."""
 
         # ── 0. Semantic cache check ────────────────────────────────────────
         try:
-            cached = await check_cache(request.query)
+            cached = await check_cache(body.query)
         except Exception as exc:
             logger.warning("Cache check failed (stream): %s", exc)
             cached = None
@@ -237,7 +249,7 @@ async def chat_stream(
             yield json.dumps({
                 "type": "done",
                 "message_id": message_id,
-                "session_id": request.session_id,
+                "session_id": body.session_id,
             })
             return
 
@@ -251,16 +263,17 @@ async def chat_stream(
             id=uuid.uuid4(),
             session_id=session_uuid,
             role="user",
-            content=request.query,
+            content=body.query,
         )
         db.add(user_msg)
         await db.commit()
 
         # ── 3. Build initial pipeline state ───────────────────────────────
         initial_state: GraphState = {
-            "query": request.query,
-            "session_id": request.session_id,
+            "query": body.query,
+            "session_id": body.session_id,
             "summaries": summaries,
+            "intent": "",
             "enhanced_query": "",
             "hyde_answer": "",
             "query_variants": [],
@@ -341,7 +354,7 @@ async def chat_stream(
             try:
                 await save_turn_summary(
                     assistant_message_id=uuid.UUID(message_id),
-                    query=request.query,
+                    query=body.query,
                     answer=answer,
                     db=db,
                 )
@@ -350,35 +363,37 @@ async def chat_stream(
 
             # ── 8. Store result in semantic cache (non-critical) ───────────
             try:
-                await store_cache(request.query, answer, raw_sources)
+                await store_cache(body.query, answer, raw_sources)
             except Exception as exc:
                 logger.warning("Failed to store cache (stream): %s", exc)
 
-            # ── 9. Queue background evaluation tasks ───────────────────────
-            try:
-                contexts = [c.get("content", "") for c in final_state["compressed_contexts"]]
-                log_retrieval_details.delay(
-                    message_id=message_id,
-                    enhanced_query=final_state["enhanced_query"],
-                    hyde_answer=final_state["hyde_answer"],
-                    retrieved_child_ids=[c["child_id"] for c in final_state["retrieved_chunks"]],
-                    retrieved_parent_ids=[c.get("chunk_id", "") for c in final_state["parent_chunks"]],
-                    reranker_scores={
-                        c.get("chunk_id", f"chunk_{i}"): float(i + 1)
-                        for i, c in enumerate(final_state["reranked_chunks"])
-                    },
-                    relevance_verdict=final_state["relevance_verdict"],
-                    hallucination_verdict=final_state["hallucination_verdict"],
-                    latency_ms=_stream_latency_ms,
-                )
-                evaluate_with_ragas.delay(
-                    message_id=message_id,
-                    query=request.query,
-                    answer=answer,
-                    contexts=contexts,
-                )
-            except Exception as exc:
-                logger.warning("Failed to queue evaluation tasks (stream): %s", exc)
+            # ── 9. Queue background evaluation tasks (medical queries only) ──
+            is_medical = final_state.get("intent", "medical") != "conversational"
+            if is_medical:
+                try:
+                    contexts = [c.get("content", "") for c in final_state["compressed_contexts"]]
+                    log_retrieval_details.delay(
+                        message_id=message_id,
+                        enhanced_query=final_state["enhanced_query"],
+                        hyde_answer=final_state["hyde_answer"],
+                        retrieved_child_ids=[c["child_id"] for c in final_state["retrieved_chunks"]],
+                        retrieved_parent_ids=[c.get("chunk_id", "") for c in final_state["parent_chunks"]],
+                        reranker_scores={
+                            c.get("chunk_id", f"chunk_{i}"): float(i + 1)
+                            for i, c in enumerate(final_state["reranked_chunks"])
+                        },
+                        relevance_verdict=final_state["relevance_verdict"],
+                        hallucination_verdict=final_state["hallucination_verdict"],
+                        latency_ms=_stream_latency_ms,
+                    )
+                    evaluate_with_ragas.delay(
+                        message_id=message_id,
+                        query=body.query,
+                        answer=answer,
+                        contexts=contexts,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to queue evaluation tasks (stream): %s", exc)
 
             # ── 10. Emit sources and done ──────────────────────────────────
             sources = [
@@ -395,7 +410,7 @@ async def chat_stream(
             yield json.dumps({
                 "type": "done",
                 "message_id": message_id,
-                "session_id": request.session_id,
+                "session_id": body.session_id,
             })
 
         finally:
