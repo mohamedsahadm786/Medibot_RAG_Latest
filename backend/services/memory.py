@@ -32,9 +32,12 @@ _SUMMARY_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             "You are a medical conversation summariser. Given one Q&A exchange, "
-            "write a single concise sentence (max 80 words) summarising what the "
-            "user asked and what the key answer was.\n"
-            "Format: 'User asked about [topic]; assistant explained [key point(s)].'\n"
+            "write a single concise sentence (max 80 words) capturing the key information.\n"
+            "CRITICAL RULES:\n"
+            "- If the user shared their name, ALWAYS include it: "
+            "'User introduced themselves as [Name]; assistant greeted them.'\n"
+            "- If the user shared personal info (age, condition, location), include it explicitly.\n"
+            "- For medical questions: 'User asked about [topic]; assistant explained [key point(s)].'\n"
             "Return ONLY the summary sentence — no extra text.",
         ),
         (

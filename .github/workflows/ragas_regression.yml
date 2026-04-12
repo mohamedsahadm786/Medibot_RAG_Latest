@@ -1,0 +1,76 @@
+name: RAGAS Regression
+
+# Manual trigger only — RAGAS evaluation calls OpenAI on every question
+# and is too expensive to run on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      faithfulness_threshold:
+        description: "Min avg faithfulness (0.0–1.0)"
+        required: false
+        default: "0.85"
+      relevancy_threshold:
+        description: "Min avg answer_relevancy (0.0–1.0)"
+        required: false
+        default: "0.80"
+
+jobs:
+  ragas-regression:
+    name: RAGAS Regression Suite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: medibot
+          POSTGRES_PASSWORD: medibot
+          POSTGRES_DB: medibot_v2
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://medibot:medibot@localhost:5432/medibot_v2
+      REDIS_URL: redis://localhost:6379/0
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME: medibot-v2
+      PINECONE_NAMESPACE: medibot
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU-only torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run RAGAS regression suite
+        run: |
+          pytest tests/ragas_regression/test_ragas_regression.py -v -s \
+            --tb=short
+
+      - name: Upload results.json as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ragas-regression-results
+          path: tests/ragas_regression/results.json
+          retention-days: 30

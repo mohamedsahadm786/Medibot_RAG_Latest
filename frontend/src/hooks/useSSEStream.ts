@@ -72,6 +72,8 @@ export function useSSEStream() {
 
         // Sync the backend message_id into the store so feedback works correctly.
         // The frontend generated a temp UUID; the DB uses the backend's UUID.
+        // Use effectiveId for all subsequent store operations so they find the message.
+        const effectiveId = data.message_id ?? assistantMessageId;
         if (data.message_id && data.message_id !== assistantMessageId) {
           updateMessageId(sessionId, assistantMessageId, data.message_id);
         }
@@ -83,7 +85,7 @@ export function useSSEStream() {
           const words = data.answer.split(" ");
           for (let i = 0; i < words.length; i++) {
             const token = i < words.length - 1 ? words[i] + " " : words[i];
-            appendToken(sessionId, assistantMessageId, token);
+            appendToken(sessionId, effectiveId, token);
             // Small delay between words for typing effect
             await new Promise((resolve) => setTimeout(resolve, 18));
           }
@@ -91,10 +93,10 @@ export function useSSEStream() {
 
         // Set sources after answer is fully typed
         if (data.sources?.length) {
-          setSources(sessionId, assistantMessageId, data.sources);
+          setSources(sessionId, effectiveId, data.sources);
         }
 
-        finalizeMessage(sessionId, assistantMessageId);
+        finalizeMessage(sessionId, effectiveId);
         setStatus(null);
         setIsStreaming(false);
       } catch (err) {

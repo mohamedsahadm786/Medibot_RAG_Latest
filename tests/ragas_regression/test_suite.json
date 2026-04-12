@@ -1,0 +1,12 @@
+[
+  {
+    "question": "What are the main symptoms of type 2 diabetes mellitus?",
+    "expected_answer": "Symptoms include polyuria, polydipsia, fatigue, blurred vision, and slow wound healing.",
+    "expected_source_page": 276
+  },
+  {
+    "question": "What is the mechanism of action of beta-blockers in hypertension?",
+    "expected_answer": "Beta-blockers reduce heart rate and cardiac output by blocking beta-adrenergic receptors.",
+    "expected_source_page": 312
+  }
+]
