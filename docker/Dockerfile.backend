@@ -8,11 +8,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Install CPU-only PyTorch before requirements.txt to prevent pip from
+# pulling the default 2GB+ CUDA build (this machine and AWS t3/t2 instances
+# have no GPU — CPU-only torch is correct for this workload).
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project
+# Pre-download HuggingFace models at build time so the first query is instant.
+# Without this, models are downloaded lazily on the first request (~2 min delay).
+RUN python -c "\
+from sentence_transformers import SentenceTransformer, CrossEncoder; \
+SentenceTransformer('BAAI/bge-small-en-v1.5'); \
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')"
+
+# Pre-download NLTK data required by the evaluation pipeline
+RUN python -c "\
+import nltk; \
+nltk.download('punkt_tab'); \
+nltk.download('stopwords')"
+
+# Copy project source
 COPY . .
 
 EXPOSE 8000

@@ -66,6 +66,7 @@ class GraphState(TypedDict):
     query: str
     session_id: str
     summaries: list[str]
+    intent: str                         # medical | conversational
 
     # ── Pipeline state ─────────────────────────────────────────────────────────
     enhanced_query: str
@@ -89,6 +90,21 @@ class GraphState(TypedDict):
 
 
 # ── Prompts for CRAG and hallucination checks ──────────────────────────────────
+
+_INTENT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Classify the user message as 'medical' or 'conversational'.\n"
+            "- conversational: greetings, personal info (name, age), small talk, "
+            "questions about the bot itself\n"
+            "- medical: any question about health, symptoms, diseases, treatments, "
+            "anatomy, medications, or medical procedures\n"
+            "Return ONLY one word: medical or conversational",
+        ),
+        ("human", "Message: {query}"),
+    ]
+)
 
 _RELEVANCE_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -171,6 +187,36 @@ def build_pipeline(
     Returns:
         A compiled LangGraph graph ready for ``ainvoke()``.
     """
+
+    # ── Node 0: classify_intent ───────────────────────────────────────────────
+
+    async def node_classify_intent(state: GraphState) -> dict:
+        """Route conversational messages directly to generation, skip RAG."""
+        llm = _get_aux_llm()
+        chain = _INTENT_PROMPT | llm
+        response = await chain.ainvoke({"query": state["query"]})
+        intent = response.content.strip().lower()
+        if intent not in {"medical", "conversational"}:
+            intent = "medical"  # safe fallback
+
+        logger.info("classify_intent → %s for query: %r", intent, state["query"][:60])
+
+        if intent == "conversational":
+            # Pre-fill required state so generate_answer can run without RAG
+            return {
+                "intent": intent,
+                "enhanced_query": state["query"],
+                "compressed_contexts": [],
+                "relevance_verdict": "RELEVANT",
+                "retry_count": 0,
+                "hallucination_retry": False,
+            }
+        return {"intent": intent}
+
+    def route_after_intent(state: GraphState) -> str:
+        if state.get("intent") == "conversational":
+            return "generate_answer"
+        return "enhance_query"
 
     # ── Node 1: enhance_query ──────────────────────────────────────────────────
 
@@ -367,7 +413,7 @@ def build_pipeline(
                 "message": "",
             })
 
-        result = await generate(query=query, chunks=chunks, strict=strict)
+        result = await generate(query=query, chunks=chunks, strict=strict, summaries=state.get("summaries", []))
         logger.info(
             "generate_answer → %d chars, %d sources (strict=%s)",
             len(result["answer"]),
@@ -436,7 +482,8 @@ def build_pipeline(
     graph = StateGraph(GraphState)
 
     # Register nodes
-    graph.add_node("enhance_query",             node_enhance_query)
+    graph.add_node("classify_intent",            node_classify_intent)
+    graph.add_node("enhance_query",              node_enhance_query)
     graph.add_node("hyde_and_multiquery",        node_hyde_and_multiquery)
     graph.add_node("retrieve",                   node_retrieve)
     graph.add_node("rerank",                     node_rerank)
@@ -448,7 +495,14 @@ def build_pipeline(
     graph.add_node("hallucination_retry",        node_prepare_hallucination_retry)
 
     # Entry point
-    graph.set_entry_point("enhance_query")
+    graph.set_entry_point("classify_intent")
+
+    # Intent routing: conversational → generate_answer, medical → enhance_query
+    graph.add_conditional_edges(
+        "classify_intent",
+        route_after_intent,
+        {"generate_answer": "generate_answer", "enhance_query": "enhance_query"},
+    )
 
     # Linear edges
     graph.add_edge("enhance_query",         "hyde_and_multiquery")

@@ -20,10 +20,12 @@ SYSTEM_PROMPT = """You are a medical knowledge assistant with access to a \
 comprehensive medical reference encyclopedia.
 
 Guidelines:
-- Answer questions accurately and only based on the provided context.
-- If the context does not contain enough information to answer, say: \
+- Answer medical questions accurately and only based on the provided context.
+- If the context does not contain enough information to answer a medical question, say: \
 "I could not find sufficient information about this topic in the medical reference."
-- Always cite the section and page number your answer comes from.
+- Always cite the section and page number your answer comes from when using medical context.
+- For conversational or personal questions (e.g. greetings, user sharing their name), \
+use the conversation history to respond naturally — do not search the medical reference.
 - Be clear, structured, and use plain language where possible.
 - This information is for educational purposes only — not a substitute for \
 professional medical advice, diagnosis, or treatment."""
@@ -40,7 +42,7 @@ _PROMPT = ChatPromptTemplate.from_messages(
         ("system", SYSTEM_PROMPT),
         (
             "human",
-            "Medical Reference Context:\n{context}\n\nQuestion: {query}",
+            "Conversation History:\n{summaries}\n\nMedical Reference Context:\n{context}\n\nQuestion: {query}",
         ),
     ]
 )
@@ -50,7 +52,7 @@ _STRICT_PROMPT = ChatPromptTemplate.from_messages(
         ("system", STRICT_SYSTEM_PROMPT),
         (
             "human",
-            "Medical Reference Context:\n{context}\n\nQuestion: {query}",
+            "Conversation History:\n{summaries}\n\nMedical Reference Context:\n{context}\n\nQuestion: {query}",
         ),
     ]
 )
@@ -96,13 +98,16 @@ async def generate(
     query: str,
     chunks: list[dict[str, Any]],
     strict: bool = False,
+    summaries: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Generate a grounded medical answer from retrieved context.
 
     Args:
-        query:  The user's question.
-        chunks: Parent chunks returned by the retriever.
+        query:     The user's question.
+        chunks:    Parent chunks returned by the retriever.
+        strict:    Use the stricter hallucination-resistant prompt.
+        summaries: Conversation turn summaries for memory context.
 
     Returns:
         {
@@ -111,15 +116,20 @@ async def generate(
                          "excerpt", "source_pdf"}, ...]
         }
     """
+    summaries_text = (
+        "\n".join(f"- {s}" for s in summaries) if summaries else "None"
+    )
+
     if not chunks:
-        return {
-            "answer": (
-                "I could not find relevant information in the medical reference "
-                "to answer your question. Please try rephrasing or ask about a "
-                "different topic."
-            ),
-            "sources": [],
-        }
+        # No RAG context — let the LLM answer from conversation history alone
+        llm = _get_llm()
+        no_context_prompt = ChatPromptTemplate.from_messages([
+            ("system", SYSTEM_PROMPT),
+            ("human", "Conversation History:\n{summaries}\n\nMedical Reference Context:\nNone\n\nQuestion: {query}"),
+        ])
+        chain = no_context_prompt | llm
+        response = await chain.ainvoke({"summaries": summaries_text, "query": query})
+        return {"answer": response.content, "sources": []}
 
     context = _build_context(chunks)
     llm = _get_llm()
@@ -132,7 +142,7 @@ async def generate(
         query[:80],
     )
 
-    response = await chain.ainvoke({"context": context, "query": query})
+    response = await chain.ainvoke({"context": context, "query": query, "summaries": summaries_text})
     answer: str = response.content
 
     # Build source citations from the chunks used

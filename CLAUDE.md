@@ -28,6 +28,10 @@ cd frontend && npm run dev
 docker compose up -d
 pytest tests/
 
+## Terminal commands — NEVER run these directly
+- Do NOT run long-running commands in the Claude Code terminal (docker build, docker compose up, pip install, npm install, celery, etc.)
+- Instead, give the user the exact command to run themselves in a separate PowerShell/CMD/VS Code terminal
+
 ## Conventions
 - All API endpoints go in backend/api/routes/
 - Environment variables in .env (never commit)
